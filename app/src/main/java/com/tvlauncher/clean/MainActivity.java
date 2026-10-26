@@ -9,10 +9,18 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.content.res.AssetFileDescriptor;
+import android.graphics.Canvas;
+import android.graphics.Matrix;
 import android.graphics.Outline;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.RectF;
+import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.media.MediaPlayer;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
@@ -21,6 +29,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.view.Gravity;
+import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewOutlineProvider;
 import android.widget.FrameLayout;
@@ -45,7 +55,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 
-/** Launcher v2: tema claro estilo Apple TV, clima extendido por horas y botones redondos arriba. */
+/** Launcher v3: fondo de video (res/raw/bg.mp4), íconos de clima planos y tarjetas de vidrio. */
 public class MainActivity extends Activity {
 
     // San Miguel de Tucumán. Cambia estas coordenadas para otra ciudad.
@@ -60,14 +70,22 @@ public class MainActivity extends Activity {
 
     private static final int INK = 0xFF1C1C1E;
     private static final int MUTED = 0xFF6B7280;
+    private static final int WHITE = 0xFFFFFFFF;
     private static final int GLASS = 0xCCFFFFFF;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Locale es = new Locale("es", "AR");
     private TextView greetView, dateView, clockView, titleView;
-    private TextView wxIcon, wxTemp, wxDesc, wxRange;
+    private TextView wxTemp, wxDesc, wxRange;
+    private WxIcon wxIcon;
     private LinearLayout hourly, row;
     private long lastWeatherFetch = 0;
+
+    // Video de fondo
+    private TextureView videoView;
+    private MediaPlayer player;
+    private Surface surface;
+    private int vw = 0, vh = 0;
 
     private final BroadcastReceiver pkgReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { loadApps(); }
@@ -100,18 +118,96 @@ public class MainActivity extends Activity {
         registerReceiver(pkgReceiver, f);
     }
 
-    @Override protected void onResume() { super.onResume(); ui.post(clockTick); }
-    @Override protected void onPause() { super.onPause(); ui.removeCallbacksAndMessages(null); }
+    @Override protected void onResume() {
+        super.onResume();
+        ui.post(clockTick);
+        if (surface != null && player == null) startVideo();
+    }
+
+    @Override protected void onPause() {
+        super.onPause();
+        ui.removeCallbacksAndMessages(null);
+        releasePlayer();
+    }
+
     @Override protected void onDestroy() { super.onDestroy(); unregisterReceiver(pkgReceiver); }
     @Override public void onBackPressed() { /* el launcher no se cierra */ }
+
+    // ------------------------------------------------------ Video de fondo
+
+    private void startVideo() {
+        int id = getResources().getIdentifier("bg", "raw", getPackageName());
+        if (id == 0 || surface == null) return; // sin video: queda el degradado
+        try {
+            AssetFileDescriptor afd = getResources().openRawResourceFd(id);
+            MediaPlayer mp = new MediaPlayer();
+            mp.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
+            afd.close();
+            mp.setSurface(surface);
+            mp.setLooping(true);
+            mp.setVolume(0f, 0f);
+            mp.setOnVideoSizeChangedListener(new MediaPlayer.OnVideoSizeChangedListener() {
+                @Override public void onVideoSizeChanged(MediaPlayer m, int w, int h) {
+                    vw = w; vh = h; fitVideo();
+                }
+            });
+            mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+                @Override public void onPrepared(MediaPlayer m) { m.start(); }
+            });
+            mp.prepareAsync();
+            player = mp;
+        } catch (Exception e) {
+            player = null;
+        }
+    }
+
+    private void releasePlayer() {
+        if (player != null) {
+            try { player.release(); } catch (Exception ignored) { }
+            player = null;
+        }
+    }
+
+    /** Recorta el video para llenar la pantalla sin deformarlo. */
+    private void fitVideo() {
+        int w = videoView.getWidth(), h = videoView.getHeight();
+        if (vw == 0 || vh == 0 || w == 0 || h == 0) return;
+        float ar = (float) vw / vh, vr = (float) w / h;
+        float sx = ar > vr ? ar / vr : 1f;
+        float sy = ar > vr ? 1f : vr / ar;
+        Matrix m = new Matrix();
+        m.setScale(sx, sy, w / 2f, h / 2f);
+        videoView.setTransform(m);
+    }
 
     // ---------------------------------------------------------------- UI
 
     private void buildUi() {
         FrameLayout root = new FrameLayout(this);
         root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
-                new int[]{0xFFF2F4F8, 0xFFD3DAE6}));
+                new int[]{0xFF3B4A6B, 0xFF0F1626}));
         root.setClipChildren(false);
+
+        videoView = new TextureView(this);
+        videoView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            @Override public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+                surface = new Surface(st);
+                startVideo();
+            }
+            @Override public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) { fitVideo(); }
+            @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+                releasePlayer();
+                if (surface != null) { surface.release(); surface = null; }
+                return true;
+            }
+            @Override public void onSurfaceTextureUpdated(SurfaceTexture st) { }
+        });
+        root.addView(videoView, new FrameLayout.LayoutParams(-1, -1));
+
+        View scrim = new View(this);
+        scrim.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x22000000, 0x66000000}));
+        root.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
 
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
@@ -120,19 +216,19 @@ public class MainActivity extends Activity {
         col.setClipToPadding(false);
         root.addView(col, new FrameLayout.LayoutParams(-1, -1));
 
-        // ---- Fila superior: saludo/fecha a la izquierda; reloj y botones redondos a la derecha
+        // ---- Fila superior
         LinearLayout top = new LinearLayout(this);
         top.setGravity(Gravity.CENTER_VERTICAL);
         top.setClipChildren(false);
         LinearLayout left = new LinearLayout(this);
         left.setOrientation(LinearLayout.VERTICAL);
-        greetView = tv(30, INK, true);
-        dateView = tv(16, MUTED, false);
+        greetView = onVideo(tv(30, WHITE, true));
+        dateView = onVideo(tv(16, 0xFFE5E7EB, false));
         left.addView(greetView);
         left.addView(dateView);
         top.addView(left, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        clockView = tv(30, INK, false);
+        clockView = onVideo(tv(30, WHITE, false));
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-2, -2);
         clp.setMargins(0, 0, dp(18), 0);
         top.addView(clockView, clp);
@@ -153,9 +249,10 @@ public class MainActivity extends Activity {
         card.setPadding(dp(30), dp(14), dp(30), dp(14));
         card.setBackground(box(GLASS, 26, false));
 
-        wxIcon = tv(56, INK, false);
-        wxIcon.setGravity(Gravity.CENTER);
-        card.addView(wxIcon, new LinearLayout.LayoutParams(dp(84), -2));
+        wxIcon = new WxIcon(this);
+        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(64), dp(64));
+        ilp.setMargins(0, 0, dp(20), 0);
+        card.addView(wxIcon, ilp);
 
         LinearLayout now = new LinearLayout(this);
         now.setOrientation(LinearLayout.VERTICAL);
@@ -182,7 +279,7 @@ public class MainActivity extends Activity {
         col.addView(card, cardLp);
 
         // ---- Nombre de la app enfocada
-        titleView = tv(22, INK, true);
+        titleView = onVideo(tv(22, WHITE, true));
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(-2, -2);
         tlp.setMargins(dp(8), dp(12), 0, dp(6));
         col.addView(titleView, tlp);
@@ -201,6 +298,11 @@ public class MainActivity extends Activity {
         col.addView(hs, new LinearLayout.LayoutParams(-1, -2));
 
         setContentView(root);
+    }
+
+    private TextView onVideo(TextView t) {
+        t.setShadowLayer(8f, 0f, 2f, 0x99000000);
+        return t;
     }
 
     private View roundButton(String icon, View.OnClickListener click) {
@@ -395,7 +497,7 @@ public class MainActivity extends Activity {
             JSONObject cur = j.getJSONObject("current");
             boolean day = cur.getInt("is_day") == 1;
             int code = cur.getInt("weather_code");
-            wxIcon.setText(icon(code, day));
+            wxIcon.set(code, day);
             wxTemp.setText(Math.round(cur.getDouble("temperature_2m")) + "°");
             wxDesc.setText(desc(code));
             JSONObject d = j.getJSONObject("daily");
@@ -421,32 +523,18 @@ public class MainActivity extends Activity {
                 cell.setGravity(Gravity.CENTER);
                 TextView t1 = tv(14, MUTED, false);
                 t1.setText(time.substring(11, 13) + "h");
-                t1.setGravity(Gravity.CENTER);
-                TextView t2 = tv(26, INK, false);
-                t2.setText(icon(hc.getInt(i), hh >= 7 && hh < 20));
-                t2.setGravity(Gravity.CENTER);
+                WxIcon ic = new WxIcon(this);
+                ic.set(hc.getInt(i), hh >= 7 && hh < 20);
+                LinearLayout.LayoutParams iclp = new LinearLayout.LayoutParams(dp(30), dp(30));
+                iclp.setMargins(0, dp(4), 0, dp(4));
                 TextView t3 = tv(18, INK, true);
                 t3.setText(Math.round(hT.getDouble(i)) + "°");
-                t3.setGravity(Gravity.CENTER);
                 cell.addView(t1);
-                cell.addView(t2);
+                cell.addView(ic, iclp);
                 cell.addView(t3);
                 hourly.addView(cell, new LinearLayout.LayoutParams(0, -2, 1f));
             }
         } catch (Exception ignored) { }
-    }
-
-    private String icon(int code, boolean day) {
-        if (code == 0) return day ? "☀️" : "🌙";
-        if (code == 1) return day ? "🌤️" : "🌙";
-        if (code == 2) return day ? "⛅" : "☁️";
-        if (code == 3) return "☁️";
-        if (code == 45 || code == 48) return "🌫️";
-        if (code >= 51 && code <= 57) return "🌦️";
-        if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return "🌧️";
-        if ((code >= 71 && code <= 77) || code == 85 || code == 86) return "❄️";
-        if (code >= 95) return "⛈️";
-        return "🌡️";
     }
 
     private String desc(int code) {
@@ -461,5 +549,135 @@ public class MainActivity extends Activity {
         if ((code >= 71 && code <= 77) || code == 85 || code == 86) return "Nieve";
         if (code >= 95) return "Tormenta";
         return "Clima variable";
+    }
+
+    // ------------------------------------------- Íconos de clima (planos)
+
+    /** Ícono de clima dibujado con formas simples, en gris oscuro, sin imágenes. */
+    static class WxIcon extends View {
+        static final int CLEAR = 0, PARTLY = 1, CLOUD = 2, FOG = 3, RAIN = 4, SNOW = 5, STORM = 6;
+        private static final int DARK = 0xFF2B2F36;
+        private static final int SOFT = 0xFF8A9099;
+
+        private int kind = CLOUD;
+        private boolean day = true;
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
+        private final Path tmp = new Path();
+        private final RectF rect = new RectF();
+
+        WxIcon(Context c) { super(c); }
+
+        void set(int code, boolean isDay) {
+            day = isDay;
+            if (code == 0) kind = CLEAR;
+            else if (code == 1 || code == 2) kind = PARTLY;
+            else if (code == 3) kind = CLOUD;
+            else if (code == 45 || code == 48) kind = FOG;
+            else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) kind = RAIN;
+            else if ((code >= 71 && code <= 77) || code == 85 || code == 86) kind = SNOW;
+            else if (code >= 95) kind = STORM;
+            else kind = CLOUD;
+            invalidate();
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            float s = Math.min(getWidth(), getHeight());
+            c.save();
+            c.translate((getWidth() - s) / 2f, (getHeight() - s) / 2f);
+            p.setColor(DARK);
+            fill();
+            switch (kind) {
+                case CLEAR:
+                    celestial(c, 0.5f * s, 0.5f * s, 0.2f * s);
+                    break;
+                case PARTLY:
+                    p.setColor(SOFT);
+                    celestial(c, 0.66f * s, 0.34f * s, 0.15f * s);
+                    p.setColor(DARK);
+                    fill();
+                    cloud(c, 0.06f * s, 0.34f * s, 0.90f * s, 0.84f * s);
+                    break;
+                case CLOUD:
+                    cloud(c, 0.06f * s, 0.24f * s, 0.94f * s, 0.78f * s);
+                    break;
+                case FOG:
+                    cloud(c, 0.06f * s, 0.12f * s, 0.94f * s, 0.62f * s);
+                    stroke(0.06f * s);
+                    c.drawLine(0.16f * s, 0.74f * s, 0.84f * s, 0.74f * s, p);
+                    c.drawLine(0.28f * s, 0.88f * s, 0.72f * s, 0.88f * s, p);
+                    fill();
+                    break;
+                case RAIN:
+                    cloud(c, 0.06f * s, 0.10f * s, 0.94f * s, 0.62f * s);
+                    stroke(0.07f * s);
+                    for (float x : new float[]{0.30f, 0.50f, 0.70f}) {
+                        c.drawLine(x * s, 0.72f * s, (x - 0.07f) * s, 0.92f * s, p);
+                    }
+                    fill();
+                    break;
+                case SNOW:
+                    cloud(c, 0.06f * s, 0.10f * s, 0.94f * s, 0.62f * s);
+                    c.drawCircle(0.30f * s, 0.78f * s, 0.05f * s, p);
+                    c.drawCircle(0.50f * s, 0.90f * s, 0.05f * s, p);
+                    c.drawCircle(0.70f * s, 0.78f * s, 0.05f * s, p);
+                    break;
+                case STORM:
+                    cloud(c, 0.06f * s, 0.06f * s, 0.94f * s, 0.58f * s);
+                    path.reset();
+                    path.moveTo(0.54f * s, 0.62f * s);
+                    path.lineTo(0.36f * s, 0.84f * s);
+                    path.lineTo(0.49f * s, 0.84f * s);
+                    path.lineTo(0.43f * s, 0.99f * s);
+                    path.lineTo(0.66f * s, 0.74f * s);
+                    path.lineTo(0.53f * s, 0.74f * s);
+                    path.lineTo(0.60f * s, 0.62f * s);
+                    path.close();
+                    c.drawPath(path, p);
+                    break;
+                default:
+                    break;
+            }
+            c.restore();
+        }
+
+        private void fill() { p.setStyle(Paint.Style.FILL); }
+
+        private void stroke(float w) {
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(w);
+            p.setStrokeCap(Paint.Cap.ROUND);
+        }
+
+        private void cloud(Canvas c, float l, float t, float r, float b) {
+            float w = r - l, h = b - t, bh = 0.55f * h;
+            rect.set(l, b - bh, r, b);
+            c.drawRoundRect(rect, bh / 2f, bh / 2f, p);
+            c.drawCircle(l + 0.30f * w, b - bh, 0.28f * h, p);
+            c.drawCircle(l + 0.60f * w, b - bh - 0.02f * h, 0.40f * h, p);
+        }
+
+        private void celestial(Canvas c, float cx, float cy, float r) {
+            if (day) {
+                fill();
+                c.drawCircle(cx, cy, r, p);
+                stroke(r * 0.28f);
+                for (int i = 0; i < 8; i++) {
+                    double a = i * Math.PI / 4.0;
+                    float cs = (float) Math.cos(a), sn = (float) Math.sin(a);
+                    c.drawLine(cx + cs * r * 1.45f, cy + sn * r * 1.45f,
+                            cx + cs * r * 1.9f, cy + sn * r * 1.9f, p);
+                }
+                fill();
+            } else {
+                path.reset();
+                path.addCircle(cx, cy, r, Path.Direction.CW);
+                tmp.reset();
+                tmp.addCircle(cx + r * 0.5f, cy - r * 0.3f, r * 0.85f, Path.Direction.CW);
+                path.op(tmp, Path.Op.DIFFERENCE);
+                fill();
+                c.drawPath(path, p);
+            }
+        }
     }
 }
